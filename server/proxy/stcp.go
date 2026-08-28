@@ -15,33 +15,37 @@
 package proxy
 
 import (
-	"github.com/fatedier/frp/models/config"
+	"reflect"
+
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 )
 
-type StcpProxy struct {
-	*BaseProxy
-	cfg *config.StcpProxyConf
+func init() {
+	RegisterProxyFactory(reflect.TypeFor[*v1.STCPProxyConfig](), NewSTCPProxy)
 }
 
-func (pxy *StcpProxy) Run() (remoteAddr string, err error) {
-	listener, errRet := pxy.rc.VisitorManager.Listen(pxy.GetName(), pxy.cfg.Sk)
-	if errRet != nil {
-		err = errRet
-		return
-	}
-	listener.AddLogPrefix(pxy.name)
-	pxy.listeners = append(pxy.listeners, listener)
-	pxy.Info("stcp proxy custom listen success")
+type STCPProxy struct {
+	*BaseProxy
+	cfg *v1.STCPProxyConfig
+}
 
-	pxy.startListenHandler(pxy, HandleUserTcpConnection)
+func NewSTCPProxy(baseProxy *BaseProxy) Proxy {
+	unwrapped, ok := baseProxy.GetConfigurer().(*v1.STCPProxyConfig)
+	if !ok {
+		return nil
+	}
+	return &STCPProxy{
+		BaseProxy: baseProxy,
+		cfg:       unwrapped,
+	}
+}
+
+func (pxy *STCPProxy) Run() (remoteAddr string, err error) {
+	err = pxy.startVisitorListener(pxy.cfg.Secretkey, pxy.cfg.AllowUsers, "stcp")
 	return
 }
 
-func (pxy *StcpProxy) GetConf() config.ProxyConf {
-	return pxy.cfg
-}
-
-func (pxy *StcpProxy) Close() {
+func (pxy *STCPProxy) Close() {
 	pxy.BaseProxy.Close()
 	pxy.rc.VisitorManager.CloseListener(pxy.GetName())
 }

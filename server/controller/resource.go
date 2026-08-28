@@ -15,32 +15,60 @@
 package controller
 
 import (
-	"github.com/fatedier/frp/models/nathole"
+	"github.com/fatedier/frp/pkg/nathole"
+	plugin "github.com/fatedier/frp/pkg/plugin/server"
+	"github.com/fatedier/frp/pkg/util/tcpmux"
+	"github.com/fatedier/frp/pkg/util/vhost"
 	"github.com/fatedier/frp/server/group"
 	"github.com/fatedier/frp/server/ports"
-	"github.com/fatedier/frp/utils/vhost"
+	"github.com/fatedier/frp/server/visitor"
 )
 
 // All resource managers and controllers
 type ResourceController struct {
 	// Manage all visitor listeners
-	VisitorManager *VisitorManager
+	VisitorManager *visitor.Manager
 
-	// Tcp Group Controller
-	TcpGroupCtl *group.TcpGroupCtl
+	// TCP Group Controller
+	TCPGroupCtl *group.TCPGroupCtl
 
-	// Manage all tcp ports
-	TcpPortManager *ports.PortManager
+	// HTTP Group Controller
+	HTTPGroupCtl *group.HTTPGroupController
 
-	// Manage all udp ports
-	UdpPortManager *ports.PortManager
+	// HTTPS Group Controller
+	HTTPSGroupCtl *group.HTTPSGroupController
 
-	// For http proxies, forwarding http requests
-	HttpReverseProxy *vhost.HttpReverseProxy
+	// TCP Mux Group Controller
+	TCPMuxGroupCtl *group.TCPMuxGroupCtl
 
-	// For https proxies, route requests to different clients by hostname and other infomation
-	VhostHttpsMuxer *vhost.HttpsMuxer
+	// Manage all TCP ports
+	TCPPortManager *ports.Manager
+
+	// Manage all UDP ports
+	UDPPortManager *ports.Manager
+
+	// For HTTP proxies, forwarding HTTP requests
+	HTTPReverseProxy *vhost.HTTPReverseProxy
+
+	// For HTTPS proxies, route requests to different clients by hostname and other information
+	VhostHTTPSMuxer *vhost.HTTPSMuxer
 
 	// Controller for nat hole connections
-	NatHoleController *nathole.NatHoleController
+	NatHoleController *nathole.Controller
+
+	// TCPMux HTTP CONNECT multiplexer
+	TCPMuxHTTPConnectMuxer *tcpmux.HTTPConnectTCPMuxer
+
+	// All server manager plugin
+	PluginManager *plugin.Manager
+}
+
+func (rc *ResourceController) Close() error {
+	if rc.VhostHTTPSMuxer != nil {
+		rc.VhostHTTPSMuxer.Close()
+	}
+	if rc.TCPMuxHTTPConnectMuxer != nil {
+		rc.TCPMuxHTTPConnectMuxer.Close()
+	}
+	return nil
 }

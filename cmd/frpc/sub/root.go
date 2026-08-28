@@ -17,66 +17,43 @@ package sub
 import (
 	"context"
 	"fmt"
-	"net"
+	"io/fs"
 	"os"
 	"os/signal"
-	"strconv"
+	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/fatedier/frp/client"
-	"github.com/fatedier/frp/g"
-	"github.com/fatedier/frp/models/config"
-	"github.com/fatedier/frp/utils/log"
-	"github.com/fatedier/frp/utils/version"
-)
-
-const (
-	CfgFileTypeIni = iota
-	CfgFileTypeCmd
+	"github.com/fatedier/frp/pkg/config"
+	"github.com/fatedier/frp/pkg/config/source"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
+	"github.com/fatedier/frp/pkg/policy/security"
+	"github.com/fatedier/frp/pkg/util/log"
+	"github.com/fatedier/frp/pkg/util/version"
 )
 
 var (
-	cfgFile     string
-	showVersion bool
-
-	serverAddr string
-	user       string
-	protocol   string
-	token      string
-	logLevel   string
-	logFile    string
-	logMaxDays int
-
-	proxyName         string
-	localIp           string
-	localPort         int
-	remotePort        int
-	useEncryption     bool
-	useCompression    bool
-	customDomains     string
-	subDomain         string
-	httpUser          string
-	httpPwd           string
-	locations         string
-	hostHeaderRewrite string
-	role              string
-	sk                string
-	serverName        string
-	bindAddr          string
-	bindPort          int
-
-	kcpDoneCh chan struct{}
+	cfgFile          string
+	cfgDir           string
+	showVersion      bool
+	strictConfigMode bool
+	allowUnsafe      []string
 )
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "./frpc.ini", "config file of frpc")
+	rootCmd.PersistentFlags().StringVarP(&cfgDir, "config_dir", "", "", "config directory, run one frpc service for each file in config directory")
 	rootCmd.PersistentFlags().BoolVarP(&showVersion, "version", "v", false, "version of frpc")
+	rootCmd.PersistentFlags().BoolVarP(&strictConfigMode, "strict_config", "", true, "strict config parsing mode, unknown fields will cause an errors")
 
-	kcpDoneCh = make(chan struct{})
+	rootCmd.PersistentFlags().StringSliceVarP(&allowUnsafe, "allow-unsafe", "", []string{},
+		fmt.Sprintf("allowed unsafe features, one or more of: %s", strings.Join(security.ClientUnsafeFeatures, ", ")))
 }
 
 var rootCmd = &cobra.Command{
@@ -88,8 +65,17 @@ var rootCmd = &cobra.Command{
 			return nil
 		}
 
+		unsafeFeatures := security.NewUnsafeFeatures(allowUnsafe)
+
+		// If cfgDir is not empty, run multiple frpc service for each config file in cfgDir.
+		// Note that it's only designed for testing. It's not guaranteed to be stable.
+		if cfgDir != "" {
+			_ = runMultipleClients(cfgDir, unsafeFeatures)
+			return nil
+		}
+
 		// Do not show command usage here.
-		err := runClient(cfgFile)
+		err := runClient(cfgFile, unsafeFeatures)
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
@@ -98,127 +84,129 @@ var rootCmd = &cobra.Command{
 	},
 }
 
+func runMultipleClients(cfgDir string, unsafeFeatures *security.UnsafeFeatures) error {
+	var wg sync.WaitGroup
+	err := filepath.WalkDir(cfgDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		wg.Add(1)
+		time.Sleep(time.Millisecond)
+		go func() {
+			defer wg.Done()
+			err := runClient(path, unsafeFeatures)
+			if err != nil {
+				fmt.Printf("frpc service error for config file [%s]\n", path)
+			}
+		}()
+		return nil
+	})
+	wg.Wait()
+	return err
+}
+
 func Execute() {
+	rootCmd.SetGlobalNormalizationFunc(config.WordSepNormalizeFunc)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
-func handleSignal(svr *client.Service) {
-	ch := make(chan os.Signal)
+func handleTermSignal(svr *client.Service) {
+	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
-	svr.Close()
-	time.Sleep(250 * time.Millisecond)
-	close(kcpDoneCh)
+	svr.GracefulClose(500 * time.Millisecond)
 }
 
-func parseClientCommonCfg(fileType int, content string) (err error) {
-	if fileType == CfgFileTypeIni {
-		err = parseClientCommonCfgFromIni(content)
-	} else if fileType == CfgFileTypeCmd {
-		err = parseClientCommonCfgFromCmd()
-	}
-	if err != nil {
-		return
-	}
-
-	err = g.GlbClientCfg.ClientCommonConf.Check()
-	if err != nil {
-		return
-	}
-	return
-}
-
-func parseClientCommonCfgFromIni(content string) (err error) {
-	cfg, err := config.UnmarshalClientConfFromIni(&g.GlbClientCfg.ClientCommonConf, content)
+func runClient(cfgFilePath string, unsafeFeatures *security.UnsafeFeatures) error {
+	// Load configuration
+	result, err := config.LoadClientConfigResult(cfgFilePath, strictConfigMode)
 	if err != nil {
 		return err
 	}
-	g.GlbClientCfg.ClientCommonConf = *cfg
-	return
+	if result.IsLegacyFormat {
+		fmt.Printf("WARNING: ini format is deprecated and the support will be removed in the future, " +
+			"please use yaml/json/toml format instead!\n")
+	}
+
+	return runClientWithAggregator(result, unsafeFeatures, cfgFilePath)
 }
 
-func parseClientCommonCfgFromCmd() (err error) {
-	strs := strings.Split(serverAddr, ":")
-	if len(strs) < 2 {
-		err = fmt.Errorf("invalid server_addr")
-		return
+// runClientWithAggregator runs the client using the internal source aggregator.
+func runClientWithAggregator(result *config.ClientConfigLoadResult, unsafeFeatures *security.UnsafeFeatures, cfgFilePath string) error {
+	configSource := source.NewConfigSource()
+	if err := configSource.ReplaceAll(result.Proxies, result.Visitors); err != nil {
+		return fmt.Errorf("failed to set config source: %w", err)
 	}
-	if strs[0] != "" {
-		g.GlbClientCfg.ServerAddr = strs[0]
+
+	var storeSource *source.StoreSource
+
+	if result.Common.Store.IsEnabled() {
+		storePath := result.Common.Store.Path
+		if storePath != "" && cfgFilePath != "" && !filepath.IsAbs(storePath) {
+			storePath = filepath.Join(filepath.Dir(cfgFilePath), storePath)
+		}
+
+		s, err := source.NewStoreSource(source.StoreSourceConfig{
+			Path: storePath,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create store source: %w", err)
+		}
+		storeSource = s
 	}
-	g.GlbClientCfg.ServerPort, err = strconv.Atoi(strs[1])
+
+	aggregator := source.NewAggregator(configSource)
+	if storeSource != nil {
+		aggregator.SetStoreSource(storeSource)
+	}
+
+	proxyCfgs, visitorCfgs, err := aggregator.Load()
 	if err != nil {
-		err = fmt.Errorf("invalid server_addr")
-		return
+		return fmt.Errorf("failed to load config from sources: %w", err)
 	}
 
-	g.GlbClientCfg.User = user
-	g.GlbClientCfg.Protocol = protocol
-	g.GlbClientCfg.Token = token
-	g.GlbClientCfg.LogLevel = logLevel
-	g.GlbClientCfg.LogFile = logFile
-	g.GlbClientCfg.LogMaxDays = int64(logMaxDays)
-	if logFile == "console" {
-		g.GlbClientCfg.LogWay = "console"
-	} else {
-		g.GlbClientCfg.LogWay = "file"
-	}
-	return nil
-}
+	proxyCfgs, visitorCfgs = config.FilterClientConfigurers(result.Common, proxyCfgs, visitorCfgs)
+	proxyCfgs = config.CompleteProxyConfigurers(proxyCfgs)
+	visitorCfgs = config.CompleteVisitorConfigurers(visitorCfgs)
 
-func runClient(cfgFilePath string) (err error) {
-	var content string
-	content, err = config.GetRenderedConfFromFile(cfgFilePath)
-	if err != nil {
-		return
+	warning, err := validation.ValidateAllClientConfig(result.Common, proxyCfgs, visitorCfgs, unsafeFeatures)
+	if warning != nil {
+		fmt.Printf("WARNING: %v\n", warning)
 	}
-	g.GlbClientCfg.CfgFile = cfgFilePath
-
-	err = parseClientCommonCfg(CfgFileTypeIni, content)
-	if err != nil {
-		return
-	}
-
-	pxyCfgs, visitorCfgs, err := config.LoadAllConfFromIni(g.GlbClientCfg.User, content, g.GlbClientCfg.Start)
 	if err != nil {
 		return err
 	}
 
-	err = startService(pxyCfgs, visitorCfgs)
-	return
+	return startServiceWithAggregator(result.Common, aggregator, unsafeFeatures, cfgFilePath)
 }
 
-func startService(pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.VisitorConf) (err error) {
-	log.InitLog(g.GlbClientCfg.LogWay, g.GlbClientCfg.LogFile, g.GlbClientCfg.LogLevel, g.GlbClientCfg.LogMaxDays)
-	if g.GlbClientCfg.DnsServer != "" {
-		s := g.GlbClientCfg.DnsServer
-		if !strings.Contains(s, ":") {
-			s += ":53"
-		}
-		// Change default dns server for frpc
-		net.DefaultResolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return net.Dial("udp", s)
-			},
-		}
+func startServiceWithAggregator(
+	cfg *v1.ClientCommonConfig,
+	aggregator *source.Aggregator,
+	unsafeFeatures *security.UnsafeFeatures,
+	cfgFile string,
+) error {
+	log.InitLogger(cfg.Log.To, cfg.Log.Level, int(cfg.Log.MaxDays), cfg.Log.DisablePrintColor)
+
+	if cfgFile != "" {
+		log.Infof("start frpc service for config file [%s] with aggregated configuration", cfgFile)
+		defer log.Infof("frpc service for config file [%s] stopped", cfgFile)
 	}
-	svr, errRet := client.NewService(pxyCfgs, visitorCfgs)
-	if errRet != nil {
-		err = errRet
-		return
+	svr, err := client.NewService(client.ServiceOptions{
+		Common:                 cfg,
+		ConfigSourceAggregator: aggregator,
+		UnsafeFeatures:         unsafeFeatures,
+		ConfigFilePath:         cfgFile,
+	})
+	if err != nil {
+		return err
 	}
 
-	// Capture the exit signal if we use kcp.
-	if g.GlbClientCfg.Protocol == "kcp" {
-		go handleSignal(svr)
+	shouldGracefulClose := cfg.Transport.Protocol == "kcp" || cfg.Transport.Protocol == "quic"
+	if shouldGracefulClose {
+		go handleTermSignal(svr)
 	}
-
-	err = svr.Run()
-	if g.GlbClientCfg.Protocol == "kcp" {
-		<-kcpDoneCh
-	}
-	return
+	return svr.Run(context.Background())
 }
